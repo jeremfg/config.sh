@@ -1,0 +1,13 @@
+{
+  "name": "config.sh",
+  "version": "0.1.0-patate",
+  "description": "Manage .env configuration files",
+  "install": "install -m 0644 src/config.sh ${PREFIX}/lib",
+  "files": ["src/config.sh"],
+  "dependencies": {
+    "jeremfg/slf4.sh": "1.0.0"
+  },
+  "dependencies-dev": {
+    "jeremfg/semver.sh": "1.0.0"
+  }
+}

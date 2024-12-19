@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# Perform release tagging
+
+# Make sure we are being executed
+if [[ -p /dev/stdin ]] && [[ -z ${BASH_SOURCE[0]} ]]; then
+  # This script was piped
+  echo "ERROR: This script cannot be piped"
+  exit 1
+elif [[ ${BASH_SOURCE[0]} != "${0}" ]]; then
+  echo "ERROR: This script cannot be sourced"
+  exit 1
+fi
+
+# Get root directory of the project
+# https://stackoverflow.com/a/246128
+CF_SOURCE=${BASH_SOURCE[0]}
+while [[ -L "${CF_SOURCE}" ]]; do # resolve $CF_SOURCE until the file is no longer a symlink
+  CF_ROOT=$(cd -P "$(dirname "${CF_SOURCE}")" >/dev/null 2>&1 && pwd)
+  CF_SOURCE=$(readlink "${CF_SOURCE}")
+  [[ ${CF_SOURCE} != /* ]] && CF_SOURCE=${CF_ROOT}/${CF_SOURCE} # if $CF_SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+CF_ROOT=$(cd -P "$(dirname "${CF_SOURCE}")" >/dev/null 2>&1 && pwd)
+CF_ROOT=$(realpath "${CF_ROOT}/..")
+
+# Sanity check
+if [[ ! -f "${CF_ROOT}/tool/$(basename "${BASH_SOURCE[0]}")" ]]; then
+  echo "Could not identify this project's ROOT"
+  echo "Expected: ${CF_ROOT}/tool/$(basename "${BASH_SOURCE[0]}")"
+  exit 1
+fi
+
+# Make sure a version was passed
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $(basename "${BASH_SOURCE[0]}") <version>"
+  exit 1
+fi
+
+# Check if the version is a valid semantic version
+if command -v semver &>/dev/null; then
+  # shellcheck disable=SC1090 # source is here: ~/.local/bin/semver
+  source "$(command -v semver || true)"
+  # shellcheck disable=SC2154
+  if [[ ! "${1}" =~ ${SEMVER_REGEX} ]]; then
+    echo "Does not conform to Semantic Version 2.0.0: ${1}"
+    exit 1
+  fi
+else
+  echo "semver not found. Please install it by running setup"
+  exit 1
+fi
+
+# Make sure there are no uncommited changes
+if [[ -n $(git status -s || true) ]]; then
+  echo "There are uncommited changes"
+  exit 1
+fi
+
+# Set version in config.sh
+if ! sed -i "s/CONFIG_VERSION=.*/CONFIG_VERSION=\"${1}\"/" "${CF_ROOT}/src/config.sh"; then
+  echo "Failed to set version in config.sh"
+  exit 1
+fi
+if ! git add "${CF_ROOT}/src/config.sh"; then
+  echo "Failed to add config.sh to git"
+  exit 1
+fi
+
+# Set version in bpkg.json
+if ! sed -i "s/\"version\": \".*\"/\"version\": \"${1}\"/" "${CF_ROOT}/bpkg.json"; then
+  echo "Failed to set version in bpkg.json"
+  exit 1
+fi
+if ! git add "${CF_ROOT}/bpkg.json"; then
+  echo "Failed to add bpkg.json to git"
+  exit 1
+fi
+
+if ! git commit -m "Release ${1}"; then
+  echo "Failed to commit changes"
+  exit 1
+fi
+if ! git tag -a "${1}" -m "Release ${1}"; then
+  echo "Failed to tag release"
+  exit 1
+fi
+
+echo "Release ${1} tagged successfully"
+exit 0
