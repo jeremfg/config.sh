@@ -1,90 +1,819 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Perform release tagging
+# Perform a release
+
+rl_main() {
+  # shellcheck disable=SC2119
+  if ! rL_parse; then
+    return 1
+  fi
+
+  # General information
+  if [[ "${DRY_RUN}" == true ]]; then
+    logTrace "Dry-run mode enabled"
+  fi
+  if [[ ${PUSH} == true ]]; then
+    logTrace "Pushing tags enabled"
+  fi
+
+  if ! rl_valid_version; then
+    return 1
+  fi
+
+  if ! rl_check_repo; then
+    return 1
+  fi
+
+  if ! rl_tag; then
+    return 1
+  fi
+
+  # Perform push if requested
+  if [[ ${PUSH} == true ]]; then
+    if ! rl_push_all; then
+      logError "Failed to push tags"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+rl_push_all() {
+  local remote
+  if ! remote=$(git -C "${RL_ROOT}" remote); then
+    logError "Failed to get remote"
+    return 1
+  elif [[ -z "${remote}" ]]; then
+    logError "No remote found"
+    return 1
+  else
+    logDebug "Remote: ${remote}"
+  fi
+
+  if [[ -n "${MAIN_HASH}" ]]; then
+    if ! rl_push "${RL_MAIN_BRANCH}" "${remote}"; then
+      return 1
+    fi
+  fi
+  if [[ -n "${DEV_HASH}" ]]; then
+    if ! rl_push "${RL_DEV_BRANCH}" "${remote}"; then
+      return 1
+    fi
+  fi
+  if [[ -n "${TAG_ID}" ]]; then
+    if ! rl_push "${TAG_VERSION}" "${remote}"; then
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# Rollback the release
+#
+# Returns:
+#   0: If the rollback was successful
+#   1: If an error occurred
+rl_rollback() {
+  local success
+  success=1
+
+  # If we created a tag, delete it
+  if [[ -n "${TAG_ID}" ]]; then
+    if ! rl_delete_tag; then
+      success=0
+    fi
+  fi
+
+  # If we commited on DEV branch, reset it
+  if [[ -n "${DEV_HASH}" ]]; then
+    if ! rl_checkout_branch "${RL_DEV_BRANCH}"; then
+      success=0
+    elif ! rl_reset "${DEV_HASH}"; then
+      success=0
+    fi
+  fi
+
+  # If we commited on MAIN branch, reset it
+  if [[ -n "${MAIN_HASH}" ]]; then
+    if ! rl_checkout_branch "${RL_MAIN_BRANCH}"; then
+      success=0
+    elif ! rl_reset "${MAIN_HASH}"; then
+      success=0
+    fi
+  fi
+
+  # If we changed branch, return to original branch
+  if [[ -n "${OLD_BRANCH}" ]]; then
+    if ! rl_checkout_branch "${OLD_BRANCH}"; then
+      success=0
+    elif [[ -n "${OLD_HASH}" ]]; then
+      if ! rl_reset "${OLD_HASH}"; then
+        success=0
+      fi
+    fi
+  fi
+
+  if [[ ${success} -eq 0 ]]; then
+    logError "Failed to rollback"
+    return 1
+  fi
+
+  return 0
+}
+
+# Update versions in the repository
+#
+# Returns:
+#   0: If the versions were successfully updated
+#   1: If an error occurred
+rl_update_versions() {
+  local cmd res must_commit
+  must_commit=0
+
+  # Set version in config.sh
+  cmd=("sed" "-i" "s/CONFIG_VERSION=.*/CONFIG_VERSION=\"${TAG_VERSION}\"/" "${RL_ROOT}/src/config.sh")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to set version in config.sh: ${res}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+  if ! git -C "${RL_ROOT}" diff --quiet "${RL_ROOT}/src/config.sh"; then
+    must_commit=1
+    cmd=("git" "add" "${RL_ROOT}/src/config.sh")
+    if [[ "${DRY_RUN}" == false ]]; then
+      if ! res=$("${cmd[@]}"); then
+        logError "Failed to add config.sh to git: ${res}"
+        return 1
+      fi
+    else
+      echo "| DRY-RUN | Would run: ${cmd[*]}"
+    fi
+  fi
+
+  # Set version in bpkg.json
+  cmd=("sed" "-i" "s/\"version\": \".*\"/\"version\": \"${TAG_VERSION}\"/" "${RL_ROOT}/bpkg.json")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to set version in bpkg.json: ${res}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+  if ! git -C "${RL_ROOT}" diff --quiet "${RL_ROOT}/bpkg.json"; then
+    must_commit=1
+    cmd=("git" "add" "${RL_ROOT}/bpkg.json")
+    if [[ "${DRY_RUN}" == false ]]; then
+      if ! res=$("${cmd[@]}"); then
+        logError "Failed to add bpkg.json to git: ${res}"
+        return 1
+      fi
+    else
+      echo "| DRY-RUN | Would run: ${cmd[*]}"
+    fi
+  fi
+
+  # Do we have staged changes that needs to be commited?
+  if [[ ${must_commit} -eq 1 ]]; then
+    # Make sure we remember MAIN_HASH if we aren't already
+    local needed_to_remember=0
+    if [[ -z "${MAIN_HASH}" ]]; then
+      needed_to_remember=1
+      if ! rl_current_hash res; then
+        return 1
+      fi
+      declare -g MAIN_HASH="${res}"
+    fi
+
+    # Commit the changes
+    cmd=("git" "-C" "${RL_ROOT}" "commit")
+    # If this wasn't our first commit, ammend the previous one
+    if [[ "${needed_to_remember}" -eq 0 ]]; then
+      cmd+=("--amend")
+    fi
+    cmd+=("-m" "Update versions to ${TAG_VERSION}")
+    if [[ "${DRY_RUN}" == false ]]; then
+      if ! res=$("${cmd[@]}"); then
+        logError "Failed to commit changes: ${res}"
+        return 1
+      fi
+    else
+      echo "| DRY-RUN | Would run: ${cmd[*]}"
+    fi
+  fi
+
+  return 0
+}
+
+rl_tag() {
+  # Merge in main branch
+  if ! rl_merge_in_main; then
+    rl_rollback
+    return 1
+  fi
+
+  # Update versions
+  if ! rl_update_versions; then
+    rl_rollback
+    return 1
+  fi
+
+  # Tag the release
+  if ! rl_tag_in_main; then
+    rl_rollback
+    return 1
+  fi
+
+  # Merge back in develop
+  if ! rl_merge_in_dev; then
+    rl_rollback
+    return 1
+  fi
+
+  return 0
+}
+
+rl_merge_in_main() {
+  local cur_branch cur_hash main_hash
+
+  # In case we need to rollback
+  if ! rl_cur_branch cur_branch; then
+    return 1
+  fi
+  declare -g OLD_BRANCH="${cur_branch}"
+  if ! rl_current_hash cur_hash; then
+    return 1
+  fi
+  declare -g OLD_HASH="${cur_hash}"
+
+  # Check if we already are on the correct branch (main)
+  if [[ "${cur_branch}" != "${RL_MAIN_BRANCH}" ]]; then
+    if ! rl_checkout_branch "${RL_MAIN_BRANCH}"; then
+      return 1
+    fi
+
+    # Remember hash of main branch
+    if ! rl_current_hash main_hash; then
+      return 1
+    fi
+    declare -g MAIN_HASH="${main_hash}"
+
+    # Merge in main branch
+    if ! rl_merge "${cur_hash}" "Merging in ${RL_MAIN_BRANCH} before ${TAG_VERSION} release"; then
+      return 1
+    fi
+  else
+    logInfo "Already on ${RL_MAIN_BRANCH} branch"
+  fi
+
+  return 0
+}
+
+# Perform the tagging
+#
+# Returns:
+#   0: If the tagging was successful
+#   1: If an error occurred
+rl_tag_in_main() {
+  local res cur_tag cur_hash
+
+  # Check if the commit is already tagged
+  rl_check_already_tagged cur_tag
+  res=$?
+  case ${res} in
+  0)
+    : # Tagging needs to be performed
+    ;;
+  1)
+    if [[ "${cur_tag}" == "${TAG_VERSION}" ]]; then
+      logInfo "Commit is already tagged with ${TAG_VERSION}"
+      return 0
+    else
+      logWarn "Commit is already tagged with ${cur_tag}"
+    fi
+    ;;
+  2)
+    return 1
+    ;;
+  *)
+    logError "Unknown return code: ${res}"
+    return 1
+    ;;
+  esac
+
+  # Tag the commit
+  if ! rl_tag_commit; then
+    return 1
+  elif ! rl_current_hash cur_hash; then
+    return 1
+  fi
+  declare -g TAG_ID="${cur_hash}"
+
+  return 0
+}
+
+# Merge back into develop branch
+#
+# Returns:
+#   0: If the merge was successful
+#   1: If an error occurred
+rl_merge_in_dev() {
+  local cur_dev
+
+  # Check if we need to merge back into develop
+  if [[ -n "${MAIN_HASH}" || -n "${TAG_ID}" ]]; then
+    # Checkkout dev branch
+    if ! rl_checkout_branch "${RL_DEV_BRANCH}"; then
+      return 1
+    fi
+    # Remember hash of develop branch
+    if ! rl_current_hash cur_dev; then
+      return 1
+    fi
+    declare -g DEV_HASH="${cur_dev}"
+    # Merge back into develop
+    if ! rl_merge "${RL_MAIN_BRANCH}" "Merging in ${RL_DEV_BRANCH} after ${TAG_VERSION} release"; then
+      return 1
+    fi
+    # Return to main branch
+    if ! rl_checkout_branch "${RL_MAIN_BRANCH}"; then
+      return 1
+    fi
+  fi
+}
+
+# Retrieve the current commit ID
+#
+# Parameters:
+#   $1[out]: The variable to store the current commit ID into
+# Returns:
+#   0: If the current commit ID was successfully retrieved
+#   1: If an error occurred
+rl_current_hash() {
+  declare -n hash_var="${1}"
+  local res
+
+  if ! res=$(git -C "${RL_ROOT}" rev-parse HEAD); then
+    logError "Cannot get current hash"
+    return 1
+  else
+    hash_var="${res}"
+    logDebug "Current hash: ${hash_var}"
+  fi
+
+  return 0
+}
+
+# Retrieve the currently checked out branch
+#
+# Parameters:
+#   $1[out]: The variable to store the current branch into
+# Returns:
+#   0: If the current branch was successfully retrieved
+#   1: If an error occurred
+rl_cur_branch() {
+  declare -n branch="${1}"
+
+  local res
+  if ! res=$(git -C "${RL_ROOT}" rev-parse --abbrev-ref HEAD); then
+    logError "Cannot get current branch"
+    return 1
+  else
+    branch="${res}"
+    logDebug "Current branch: ${branch}"
+  fi
+
+  return 0
+}
+
+# Checks if the tag has already been created
+#
+# Parameters:
+#   $1[out]: The current tag
+# Returns:
+#   0: If the current commit is not tagged
+#   1: If the current commit is already tagged (See $1)
+#   2: If an error occurred
+rl_check_already_tagged() {
+  declare -n tag="${1}"
+  local res
+
+  if ! res=$(git -C "${RL_ROOT}" tag --points-at HEAD); then
+    logError "Cannot check if commit is tagged"
+    return 2
+  elif [[ -n "${res}" ]]; then
+    logWarn "Commit is already tagged with ${res}"
+    # shellcheck disable=SC2034
+    tag="${res}"
+    return 1
+  fi
+  return 0
+}
+
+# Tag the current commit
+#
+# Returns:
+#   0: If the commit was successfully tagged
+#   1: If an error occurred
+rl_tag_commit() {
+  local cmd res
+
+  cmd=("git" "-C" "${RL_ROOT}" "tag" "-a" "${TAG_VERSION}" "-m" "Release ${TAG_VERSION}")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to tag commit with ${TAG_VERSION}: ${res}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+
+  return 0
+}
+
+# Delete the tag
+rl_delete_tag() {
+  local cmd res
+
+  cmd=("git" "-C" "${RL_ROOT}" "tag" "-d" "${TAG_VERSION}")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to delete tag ${TAG_VERSION}: ${res}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+
+  return 0
+}
+
+# Reset to commit ID
+#
+# Parameters:
+#   $1: The commit ID to reset to
+# Returns:
+#   0: If the reset was successful
+#   1: If an error occurred
+rl_reset() {
+  local commit="${1}"
+  local cmd res
+
+  if [[ -z "${commit}" ]]; then
+    logError "Commit not provided"
+    return 1
+  fi
+
+  cmd=("git" "-C" "${RL_ROOT}" "reset" "--hard" "${commit}")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to reset to commit ${commit}: ${res}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+
+  return 0
+}
+
+# Merge into the current branch
+#
+# Parameters:
+#   $1: The branch to merge into the current branch
+#   $2: The commit message to use for the merge
+# Returns:
+#   0: If the branch was successfully merged into the current branch
+#   1: If an error occurred
+rl_merge() {
+  local branch="${1}"
+  local msg="${2}"
+  local cmd res
+
+  if [[ -z "${branch}" || -z "${msg}" ]]; then
+    logError "Branch or message not provided"
+    return 1
+  fi
+
+  cmd=("git" "-C" "${RL_ROOT}" "merge" "--no-ff" "-m" "${msg}" "${branch}")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to merge branch ${branch}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+
+  return 0
+}
+
+# Push the specified ref to the remote
+#
+# Parameters:
+#   $1: The ref to push
+#   $2: The remote to push to
+# Returns:
+#   0: If the ref was successfully pushed
+#   1: If an error occurred
+rl_push() {
+  local ref="${1}"
+  local rem="${2}"
+  local cmd res
+
+  if [[ -z "${ref}" || -z "${rem}" ]]; then
+    logError "Ref or remote not provided"
+    return 1
+  fi
+
+  cmd=("git" "-C" "${RL_ROOT}" "push" "${rem}" "${ref}")
+  if [[ "${DRY_RUN}" == false ]]; then
+    if ! res=$("${cmd[@]}"); then
+      logError "Failed to push ref ${ref}"
+      return 1
+    fi
+  else
+    echo "| DRY-RUN | Would run: ${cmd[*]}"
+  fi
+
+  return 0
+}
+
+# Checkout a branch in the repository
+#
+# Parameters:
+#   $1: The branch to checkout
+# Returns:
+#   0: If the branch was successfully checked out
+#   1: If an error occurred
+rl_checkout_branch() {
+  local branch="${1}"
+
+  if [[ -z "${branch}" ]]; then
+    logError "Branch not provided"
+    return 1
+  fi
+
+  if ! rl_checkout_ref "${branch}"; then
+    logError "Failed to checkout branch ${branch}"
+    return 1
+  fi
+
+  if ! git -C "${RL_ROOT}" fetch --all; then
+    logError "Failed to fetch all"
+    return 1
+  fi
+
+  if ! git -C "${RL_ROOT}" pull; then
+    logError "Failed to pull branch ${branch}"
+    return 1
+  fi
+
+  return 0
+}
+
+# Checkout a reference in the repository
+#
+# Parameters:
+#   $1: The branch to checkout
+# Returns:
+#   0: If the branch was successfully checked out
+#   1: If an error occurred
+rl_checkout_ref() {
+  local ref="${1}"
+
+  if [[ -z "${ref}" ]]; then
+    logError "Ref not provided"
+    return 1
+  fi
+
+  if ! git -C "${RL_ROOT}" checkout "${ref}"; then
+    logError "Failed to checkout ref ${ref}"
+    return 1
+  fi
+
+  return 0
+}
+
+rl_check_repo() {
+  local res
+
+  # Check if git is installed
+  if ! command -v git >/dev/null; then
+    logError "git is not installed"
+    return 1
+  fi
+
+  pushd "${RL_ROOT}" &>/dev/null || return 1
+  # Check if we are in a git repository
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    logError "Not in a git repository"
+    return 1
+  fi
+
+  # Check if repo is dirty
+  if ! res=$(git status --porcelain); then
+    logError "Cannot check if repo is dirty"
+    return 1
+  elif [[ -n "${res}" ]]; then
+    logError "repo is dirty"
+    return 1
+  fi
+
+  # Make sure we aren't in a detached HEAD state
+  if ! rl_is_detached; then
+    return 1
+  fi
+
+  popd &>/dev/null || return 1
+  return 0
+}
+
+# Check if the current repository is in a detached head state
+#
+# Returns:
+#   0: if the repository is not in a detached head state
+#   1: if the repository is in a detached head state
+#   2: if the repository is in an unknown state or an error occured
+rl_is_detached() {
+  local res
+
+  if ! res=$(git rev-parse --symbolic-full-name HEAD); then
+    logError "Cannot check if repo is in a detached head state"
+    return 2
+  elif [[ -z "${res}" ]]; then
+    logError "Repo is in an unknown state"
+    return 2
+  elif [[ "${res}" == "HEAD" ]]; then
+    logError "Repo is in detached head state. Please tag from an existing branch"
+    return 1
+  fi
+
+  return 0
+}
+
+rl_valid_version() {
+  local res
+
+  # Make sure semver is installed
+  if ! command -v semver &>/dev/null; then
+    logWarn "semver not found. Trying to call the setup script"
+    if ! "${RL_ROOT}/tool/setup"; then
+      logError "Failed to setup"
+      return 1
+    fi
+  fi
+  if ! res=$(command -v semver); then
+    logError "semver still not found."
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "${res}"
+  if [[ -z "${SEMVER_REGEX}" ]]; then
+    logError "SEMVER_REGEX not found in semver"
+    return 1
+  fi
+
+  if ! [[ ${TAG_VERSION} =~ ${SEMVER_REGEX} ]]; then
+    logError "Version ${TAG_VERSION} does not conform to Semantic Version 2.0.0"
+    return 1
+  fi
+
+  return 0
+}
+
+# shellcheck disable=SC2120
+rL_parse() {
+  local short long parsed
+
+  short="hdp"
+  long="help,dry-run,push"
+  if ! parsed=$(getopt --options "${short}" --long "${long}" --name "${RL_ME}" -- "${RL_ARGS[@]}"); then
+    logError "Failed to parse arguments"
+    rl_print_usage
+    return 1
+  fi
+
+  # Handle options
+  eval set -- "${parsed}"
+  while true; do
+    case "$1" in
+    -h | --help)
+      rl_print_usage
+      exit 0
+      ;;
+    -d | --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -p | --push)
+      PUSH=true
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;; # Done parsing. The reaming arguments are positional
+    *)
+      logError "Invalid option: $1"
+      rl_print_usage
+      return 1
+      ;;
+    esac
+  done
+
+  # Handle positional arguments
+  if [[ $# -ne 1 ]]; then
+    logError "Expected 1 positional argument, got $#"
+    rl_print_usage
+    return 1
+  else
+    TAG_VERSION="$1"
+  fi
+
+  return 0
+}
+
+rl_print_usage() {
+  cat <<EOF
+Script to tag, package and create a release
+
+Usage: ${RL_ME} [OPTIONS] <version>
+
+Options:
+  -h, --help                Print this help message
+  -d, --dry-run             Do not write any changes, just print what would be done
+  -p, --push                Push the created tags to remote
+
+Arguments:
+  version                   A valid semantic version to be used as tag for this release
+
+Examples:
+  ${RL_ME} -p 1.2.2
+EOF
+}
+
+# Variables loaded externally
+SEMVER_REGEX=""
+
+# Constants
+RL_MAIN_BRANCH="main"
+RL_DEV_BRANCH="develop"
+
+# Global variables
+DRY_RUN=false
+PUSH=false
+
+###########################
+###### Startup logic ######
+###########################
+RL_ARGS=("$@")
+RL_ME=$(basename "${BASH_SOURCE[0]}")
+
+# Get directory of this script
+# https://stackoverflow.com/a/246128
+RL_SOURCE=${BASH_SOURCE[0]}
+while [[ -L "${RL_SOURCE}" ]]; do # resolve $RL_SOURCE until the file is no longer a symlink
+  RL_ROOT=$(cd -P "$(dirname "${RL_SOURCE}")" >/dev/null 2>&1 && pwd)
+  RL_SOURCE=$(readlink "${RL_SOURCE}")
+  [[ ${RL_SOURCE} != /* ]] && RL_SOURCE=${RL_ROOT}/${RL_SOURCE} # if $RL_SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+RL_ROOT=$(cd -P "$(dirname "${RL_SOURCE}")" >/dev/null 2>&1 && pwd)
+RL_ROOT=$(realpath "${RL_ROOT}/..")
+
+# Determine BPKG's global prefix
+if [[ -z "${PREFIX}" ]]; then
+  if [[ $(id -u || true) -eq 0 ]]; then
+    PREFIX="/usr/local"
+  else
+    PREFIX="${HOME}/.local"
+  fi
+fi
+
+# Import dependencies
+export LOG_CONSOLE=1 # Configure logger to print to console
+export LOG_LEVEL=0
+# shellcheck disable=SC1091
+if ! source "${PREFIX}/lib/slf4.sh"; then
+  echo "Failed to import slf4.sh"
+  exit 1
+fi
 
 # Make sure we are being executed
 if [[ -p /dev/stdin ]] && [[ -z ${BASH_SOURCE[0]} ]]; then
   # This script was piped
-  echo "ERROR: This script cannot be piped"
-  exit 1
+  logFatal "This script cannot be piped"
 elif [[ ${BASH_SOURCE[0]} != "${0}" ]]; then
-  echo "ERROR: This script cannot be sourced"
-  exit 1
-fi
-
-# Get root directory of the project
-# https://stackoverflow.com/a/246128
-CF_SOURCE=${BASH_SOURCE[0]}
-while [[ -L "${CF_SOURCE}" ]]; do # resolve $CF_SOURCE until the file is no longer a symlink
-  CF_ROOT=$(cd -P "$(dirname "${CF_SOURCE}")" >/dev/null 2>&1 && pwd)
-  CF_SOURCE=$(readlink "${CF_SOURCE}")
-  [[ ${CF_SOURCE} != /* ]] && CF_SOURCE=${CF_ROOT}/${CF_SOURCE} # if $CF_SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
-done
-CF_ROOT=$(cd -P "$(dirname "${CF_SOURCE}")" >/dev/null 2>&1 && pwd)
-CF_ROOT=$(realpath "${CF_ROOT}/..")
-
-# Sanity check
-if [[ ! -f "${CF_ROOT}/tool/$(basename "${BASH_SOURCE[0]}")" ]]; then
-  echo "Could not identify this project's ROOT"
-  echo "Expected: ${CF_ROOT}/tool/$(basename "${BASH_SOURCE[0]}")"
-  exit 1
-fi
-
-# Make sure a version was passed
-if [[ $# -ne 1 ]]; then
-  echo "Usage: $(basename "${BASH_SOURCE[0]}") <version>"
-  exit 1
-fi
-
-# Check if the version is a valid semantic version
-if command -v semver &>/dev/null; then
-  # shellcheck disable=SC1090 # source is here: ~/.local/bin/semver
-  source "$(command -v semver || true)"
-  # shellcheck disable=SC2154
-  if [[ ! "${1}" =~ ${SEMVER_REGEX} ]]; then
-    echo "Does not conform to Semantic Version 2.0.0: ${1}"
-    exit 1
-  fi
+  logFatal "This script cannot be sourced"
 else
-  echo "semver not found. Please install it by running setup"
-  exit 1
+  # This script was executed
+  rl_main
+  exit $?
 fi
-
-# Make sure there are no uncommited changes
-if [[ -n $(git status -s || true) ]]; then
-  echo "There are uncommited changes"
-  exit 1
-fi
-
-# Set version in config.sh
-if ! sed -i "s/CONFIG_VERSION=.*/CONFIG_VERSION=\"${1}\"/" "${CF_ROOT}/src/config.sh"; then
-  echo "Failed to set version in config.sh"
-  exit 1
-fi
-if ! git add "${CF_ROOT}/src/config.sh"; then
-  echo "Failed to add config.sh to git"
-  exit 1
-fi
-
-# Set version in bpkg.json
-if ! sed -i "s/\"version\": \".*\"/\"version\": \"${1}\"/" "${CF_ROOT}/bpkg.json"; then
-  echo "Failed to set version in bpkg.json"
-  exit 1
-fi
-if ! git add "${CF_ROOT}/bpkg.json"; then
-  echo "Failed to add bpkg.json to git"
-  exit 1
-fi
-
-if ! git commit -m "Release ${1}"; then
-  echo "Failed to commit changes"
-  exit 1
-fi
-if ! git tag -a "${1}" -m "Release ${1}"; then
-  echo "Failed to tag release"
-  exit 1
-fi
-
-echo "Release ${1} tagged successfully"
-exit 0

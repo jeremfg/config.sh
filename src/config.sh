@@ -9,7 +9,7 @@
 if [[ -z ${GUARD_CONFIG_SH} ]]; then
   GUARD_CONFIG_SH=1
 else
-  return
+  return 0
 fi
 
 # Load all configurations from specified file
@@ -22,30 +22,55 @@ fi
 config_load() {
   local _config_file="$1"
   if [[ -f "${_config_file}" ]]; then
-    local _content
+    local _raw_content
     # The file might be encrypted
     if command -v sops &>/dev/null &&
       sops --input-type dotenv filestatus "${_config_file}" &>/dev/null; then
-      _content=$(sops --input-type dotenv --output-type dotenv -d "${_config_file}")
+      _raw_content=$(sops --input-type dotenv --output-type dotenv -d "${_config_file}")
       logInfo "Read from encrypted ${_config_file}"
     else
-      _content=$(cat "${_config_file}")
+      _raw_content=$(cat "${_config_file}")
       logInfo "Read from ${_config_file}"
     fi
+
+    # Perform dynamic value replacements
+    local _content="${_raw_content}"
+    local _msg="" # Stores messages about replacements
+
     # Parse special value @GIT_ROOT@
-    if grep -q "@GIT_ROOT@" <<<"${CF_CWD}"; then
+    if grep -q "@GIT_ROOT@" <<<"${_content}"; then
       local git_root
-      if ! cf_git_find_root git_root "${CF_ROOT}"; then
+      if ! cf_git_find_root git_root "${CF_SCRIPT}"; then
         logError "Failed to find the root of the repository, required by ${_config_file}"
         return 1
       fi
+      _msg=$(
+        cat <<EOF
+- Replaced @GIT_ROOT@ with: ${git_root}
+EOF
+      )
       _content="${_content//"@GIT_ROOT@"/${git_root}}"
     fi
-    logTrace <<EOF
-Loading the following:
 
-${_content}
+    # If we had to perform any value replacement, prepend the message
+    if [[ -n "${_msg}" ]]; then
+      _msg=$(
+        cat <<EOF
+
+With the following value replacements:
+${_msg}
 EOF
+      )
+    fi
+
+    # Log what we loaded
+    logTrace <<EOF
+Loading configuration from ${_config_file}:
+
+${_raw_content}
+${_msg}
+EOF
+
     # shellcheck disable=SC1090 # Yes, the source file is dynamic by design
     source <(echo "${_content}")
     return 0
@@ -181,10 +206,7 @@ cf_git_find_root() {
   local _start_dir="${2}"
   local _cur_dir
 
-  if ! command -v git &>/dev/null; then
-    logError "Git not installed"
-    return 1
-  fi
+  _backup=$(pwd)
 
   # Cleanup start directory
   _start_dir=$(realpath "${_start_dir}")
@@ -193,8 +215,15 @@ cf_git_find_root() {
     return 1
   fi
 
+  # Resolve to the absolute real path
+  while [[ -L "${_start_dir}" ]]; do
+    _cur_dir=$(cd -P "$(dirname "${_start_dir}")" >/dev/null 2>&1 && pwd)
+    _start_dir=$(readlink "${_start_dir}")
+    [[ ${_start_dir} != /* ]] && _start_dir=${_cur_dir}/${_start_dir}
+  done
+  _cur_dir=$(cd -P "$(dirname "${_start_dir}")" >/dev/null 2>&1 && pwd)
+
   # First, search up the hierarchy until we find a valid directory
-  _cur_dir="${_start_dir}"
   while [[ ! -d "${_cur_dir}" ]]; do
     if [[ -z "${_cur_dir}" ]] || [[ "/" == "${_cur_dir}" ]]; then
       # We've reached the top without finding a directory. Assuming error
@@ -202,34 +231,47 @@ cf_git_find_root() {
       return 1
     fi
     # Go one level up
-    _cur_dir="$(realpath "${_start_dir}/..")"
+    _cur_dir="$(realpath "${_cur_dir}/..")"
   done
 
   # Ok, from this point we have a valid directory. Now we need to check for git
+  logInfo "Starting search for git root, starting from: ${_cur_dir}"
+  if ! command -v git &>/dev/null; then
+    logError "Git not installed"
+    return 1
+  fi
+
   if cd "${_cur_dir}" && git rev-parse --is-inside-work-tree &>/dev/null; then
-    local _next_dir="${_cur_dir}"
+    _cur_dir="$(cd "${_cur_dir}" && git rev-parse --show-toplevel)"
+    local _next_dir
+    _next_dir="$(dirname "${_cur_dir}")"
     while true; do
-      _next_dir="$(cd "${_cur_dir}" && git rev-parse --show-toplevel)/.."
-      _next_dir="$(realpath "${_next_dir}")"
       if cd "${_next_dir}" && git rev-parse --is-inside-work-tree &>/dev/null; then
-        _cur_dir="${_next_dir}"
-      else
         _cur_dir="$(cd "${_cur_dir}" && git rev-parse --show-toplevel)"
-        eval "${_root}='${_cur_dir}'"
-        return 0
+        _next_dir="$(dirname "${_cur_dir}")"
+      else
+        break
       fi
     done
+    logInfo "Found git root: ${_cur_dir}"
   else
-    # Not a git repository
-    eval "${_root}='${_start_dir}'"
-    return 2
+    logWarn "Not a git repository: ${_cur_dir}"
   fi
+
+  # Restore the original directory
+  if ! cd "${_backup}"; then
+    logError "Failed to restore original directory"
+    return 1
+  fi
+
+  eval "${_root}='${_cur_dir}'"
+  return 0
 }
 
 ###########################
 ###### Startup logic ######
 ###########################
-CF_CWD=$(pwd)
+CF_SCRIPT="${0}"
 
 # Get directory of this script
 # https://stackoverflow.com/a/246128
@@ -242,9 +284,18 @@ done
 CF_ROOT=$(cd -P "$(dirname "${CF_SOURCE}")" >/dev/null 2>&1 && pwd)
 CF_ROOT=$(realpath "${CF_ROOT}/..")
 
+# Determine BPKG's global prefix
+if [[ -z "${PREFIX}" ]]; then
+  if [[ $(id -u || true) -eq 0 ]]; then
+    PREFIX="/usr/local"
+  else
+    PREFIX="${HOME}/.local"
+  fi
+fi
+
 # Import dependencies
-# shellcheck disable=SC1090 # shellcheck cannot follow dynamic source
-if ! source ~/.local/lib/slf4.sh; then
+# shellcheck disable=SC1091 # shellcheck cannot follow dynamic source
+if ! source "${PREFIX}/lib/slf4.sh"; then
   echo "ERROR: Failed to load logging library. Was it installed?"
   exit 1
 fi

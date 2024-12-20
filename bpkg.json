@@ -5,7 +5,7 @@
   "install": "install -m 0644 src/config.sh ${PREFIX}/lib",
   "files": ["src/config.sh"],
   "dependencies": {
-    "jeremfg/slf4.sh": "1.0.0"
+    "jeremfg/slf4.sh": "1.1.0"
   },
   "dependencies-dev": {
     "jeremfg/semver.sh": "1.0.0"

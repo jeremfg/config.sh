@@ -22,7 +22,15 @@ NOTE: bpkg itself can easily be installed by calling
 In the first case, the library is installed local to your project.
 You will need to `source deps/config.sh/src/config.sh`.
 In the second case, the library is installed globally.
-You will need to `source ~/.local/lib/config.sh`.
+You will need to `source ${PREFIX}/lib/config.sh`.
+
+```txt
+NOTE from BPKG:
+
+Packages can either be global (on ${PREFIX:-/usr/local/bin} if installed
+as root or ${PREFIX:-$HOME/.local/bin} otherwize)
+or local (under ${BPKG_DEPS:-./deps}).
+```
 
 ## Features
 
@@ -37,7 +45,7 @@ Usage example:
 
 ```bash
 # Assuming a BPKG global installation
-source ~/.local/lib/config.sh
+source ${HOME}/.local/lib/config.sh
 
 config_load "~/my_cool_config.env"
 config_save "~/my_cool_config.env" "KEY_TO_SAVE" "VALUE_TO_SAVE"
