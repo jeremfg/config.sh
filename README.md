@@ -37,7 +37,7 @@ Usage example:
 
 ```bash
 # Assuming a BPKG global installation
-source ~/.local/lib/config.sh
+source ${HOME}/.local/lib/config.sh
 
 config_load "~/my_cool_config.env"
 config_save "~/my_cool_config.env" "KEY_TO_SAVE" "VALUE_TO_SAVE"

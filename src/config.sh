@@ -244,7 +244,7 @@ CF_ROOT=$(realpath "${CF_ROOT}/..")
 
 # Import dependencies
 # shellcheck disable=SC1090 # shellcheck cannot follow dynamic source
-if ! source ~/.local/lib/slf4.sh; then
+if ! source ${HOME}/.local/lib/slf4.sh; then
   echo "ERROR: Failed to load logging library. Was it installed?"
   exit 1
 fi
