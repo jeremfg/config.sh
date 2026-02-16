@@ -6,7 +6,7 @@
 # Files can contain the following special values, which will be replaced on read:
 #   - @GIT_ROOT@: The root of the git repository where CWD is located
 
-if [[ -z ${GUARD_CONFIG_SH} ]]; then
+if [[ -z ${GUARD_CONFIG_SH+x} ]]; then
   GUARD_CONFIG_SH=1
 else
   return 0
