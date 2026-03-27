@@ -6,7 +6,7 @@
 # Files can contain the following special values, which will be replaced on read:
 #   - @GIT_ROOT@: The root of the git repository where CWD is located
 
-if [[ -z ${GUARD_CONFIG_SH} ]]; then
+if [[ -z ${GUARD_CONFIG_SH+x} ]]; then
   GUARD_CONFIG_SH=1
 else
   return 0
@@ -143,6 +143,15 @@ config_save() {
 
     # Add or update the config in _content
     if grep -q "^${_config}=" <<<"${_content}"; then
+      local _current_value
+      # Invoke sed separately to avoid masking its return value when piped to head (SC2312)
+      _current_value=$(sed -n "s|^${_config}=||p" <<<"${_content}")
+      # Keep only the first line (previously done by head -n 1)
+      _current_value="${_current_value%%$'\n'*}"
+      if [[ "${_current_value}" == "${_value}" ]]; then
+        logInfo "Configuration unchanged: ${_config}"
+        return 0
+      fi
       logInfo "Updating configuration: ${_config}"
       # shellcheck disable=SC2001
       if ! _content=$(echo "${_content}" | sed "s|^${_config}=.*|${_config}=${_value}|"); then
